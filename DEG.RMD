@@ -1,0 +1,471 @@
+---
+title: "differential gene expression CM ABM"
+author: "Brenda Karumbo"
+date: "9/16/2022"
+output: html_document
+---
+
+```{r setup, include=FALSE, message=FALSE}
+knitr::opts_chunk$set(echo = T,
+                      message = F,
+                      cache = T,
+                      fig.width = 10,
+                      fig.height = 5)
+```
+
+
+Load required packages
+```{r, message=FALSE, include=FALSE}
+#load required packages
+library(edgeR)
+library(tximport)
+library(limma)
+library(SummarizedExperiment)
+library(openxlsx)
+library("BiocManager")
+library("BiocManager")
+library("zinbwave")
+library("scRNAseq")
+library("matrixStats")
+library("magrittr")
+library("biomaRt")
+library("ggplot2")
+library(cluster)
+library(factoextra)
+library(ggvenn)
+library(mixOmics)
+library(cowplot)
+library(patchwork)
+library(ruv)
+library(RUVSeq)
+library(illuminaHumanv4.db)
+library(ComplexHeatmap)
+library(cluster)
+library(factoextra)
+library(circlize)
+library(ggrepel)
+library(sva)
+```
+
+
+
+Load the data, tx2gene and metadata
+```{r,}
+setwd("/Users/bkarumbo/Desktop")
+
+
+## load the files
+all_files <-dir(path = "all_CSF/",
+           pattern = ".h5",
+           full.names = TRUE,recursive = TRUE)
+           
+           
+## cut the file path to only remain with the file name ... gsub for renaming
+all_files1<-gsub("all_CSF//|/abundance.h5",
+                 replacement = "",all_files)
+                 
+                 
+##give names to the files 
+names(all_files) <- all_files1
+
+
+##Check the names if they match to the samples
+head(all_files)
+
+
+### load the metadata
+all_meta <- read.xlsx("FULL_METADATA.xlsx",rowNames = T)
+
+
+# load tx2gne file
+load("tx2gene_final.Rdata")
+```
+
+
+Creating a kallisto object
+```{r,}
+## kallisto object with gene counts instead of transcripts 
+kallisto_all<-tximport(files = all_files,
+                             type = "kallisto", tx2gene = tx2gene_final)
+                             
+                             
+                             
+#obtaining counts
+cts_all<-kallisto_all$counts
+```
+
+
+creating a DGElist object to use in EdgeR
+```{r,}
+#Creating a DGEList object for use in edgeR.
+dgeObj_all <- DGEList(counts = cts_all,
+                  group = all_meta$Condition,
+                  samples = all_meta)
+```
+
+
+Identify samples with low library sizes and exclude them < 1000
+```{r,}
+### extract the library size information
+all_lib_size <- dgeObj_all$samples$lib.size
+
+
+## give them names
+names(all_lib_size) <- all_files1
+
+
+#### make it a dataframe and make the names row names
+all_lib_size <- as.data.frame(all_lib_size)
+all_lib_size$names <- row.names(all_lib_size)
+
+
+#### sort in ascending order 
+sort_all_lib <- all_lib_size[order(all_lib_size$all_lib_size),]
+
+
+###get a barplot with the library sizes in descending order
+plot1<- ggplot(data = sort_all_lib, aes(x = reorder(names, -all_lib_size), 
+                      y = all_lib_size)) + 
+  geom_bar(stat = "identity") + 
+  labs(title = "Library sizes of the full dataset before filtering",
+       x = "sample_names", y = "library sizes")
+       
+       
+### drop library sizes less than 1000
+filt_all_lib <- filter(all_lib_size,all_lib_size>1000)
+
+
+### know the number of samples that passed the threshold
+dim(filt_all_lib)## 118
+
+
+###plot the new filtered data
+plot2<- ggplot(data = filt_all_lib, aes(x = reorder(names, -all_lib_size), 
+                                y = all_lib_size)) + 
+  geom_bar(stat = "identity") + 
+  labs(title = "Library sizes in full dataset after filtering",
+       x = "sample_names", y = "library sizes")
+       
+       
+### extract names of the samples that passed the filter threshold and get the count data
+filt_samples <-rownames(filt_all_lib) 
+filt_cts_all <- cts_all[,filt_samples]
+
+
+### Arrange the plots using the cowplot package  
+plot1+plot2+plot_layout(ncol=1)
+``` 
+
+
+Create a new DGE list  with  the the filtered samples and perform batch correction
+```{r,}
+### get the metadata for the new filtered data
+filt_meta <- all_meta[filt_samples,]
+
+
+### create a new DGE OBJECT 
+dgeObj_filt <- DGEList(counts = filt_cts_all,
+                       group = filt_meta$Condition,
+                       samples = filt_meta)
+                       
+                       
+####normalise
+dgeObj_filt<- calcNormFactors(dgeObj_filt, method = "TMM")
+```
+
+
+Create plots before and after batch correction
+```{r}
+#### plot a PCA before batch correction
+#jpeg("Before batch correction.jpeg",width = 10,height = 10,units = "in",res = 100)
+norm_cts_filt <- edgeR::cpm(filt_cts_all)
+pca2<-pca(t(norm_cts_filt))
+P1<-plotIndiv(pca2, 
+          ind.names = FALSE,
+          group =filt_meta$Batch,
+          title = 'Distribution before batch correction',
+          style = 'ggplot2',
+          ellipse = T,  # plot using the ellipses
+          legend = TRUE, legend.title = 'Batches',
+          size.title = rel(4.5),
+          size.xlabel = rel(3),
+          size.ylabel = rel(3),
+          size.axis = rel(2),
+          size.legend = rel(2),
+          point.lwd = 2,
+          size.legend.title = rel(2.5),
+          )
+#dev.off()
+
+
+#write.xlsx(filt_meta, "filt_meta.xlsx",)
+
+
+filt_metadata<- read.xlsx("filt_meta.xlsx", rowNames = T)
+
+
+### do the batch correction  using combat seq
+corrected_counts <- sva::ComBat_seq(filt_cts_all, 
+                      batch=filt_metadata$Batch)
+                      
+                      
+### create a DGE LIST
+dgeObj_corr <- DGEList(counts = corrected_counts,
+                  group =filt_metadata$Batch,
+                  samples = filt_metadata)
+                  
+                  
+#### draw a pca after
+norm_cts_corr <- edgeR::cpm(corrected_counts)
+pca3<-pca(t(norm_cts_corr))
+#jpeg("After batch correction.jpeg",width = 10,height = 10,units = "in",res = 100)
+P2 <- plotIndiv(pca3, 
+          ind.names = FALSE,
+          group =filt_metadata$Batch,
+          title = 'Distribution after batch correction',
+          style = 'ggplot2',
+          ellipse = T,  # plot using the ellipses
+          legend = TRUE, legend.title = 'Batches',
+          size.title = rel(4.5),
+          size.xlabel = rel(3),
+          size.ylabel = rel(3),
+          size.axis = rel(2),
+          size.legend = rel(2),
+          point.lwd = 2,
+          size.legend.title = rel(2.5),
+          )
+```
+
+
+
+ABM vs cm DGE
+```{r}
+## obtain filtered , batch corrected counts and metadata for CM and ABM from the previous analysis
+metadata3 <- read.xlsx("Metadata3.xlsx",rowNames = T)
+filt_meta3 <- read.xlsx("filt_meta3.xlsx", rowNames = T)
+filt_all<- all_files[rownames(filt_meta3)]
+kallisto_filt<-tximport(files = filt_all,
+                             type = "kallisto", tx2gene = tx2gene_final,)
+#obtaining counts
+ Counts_all <- kallisto_filt$counts
+```
+
+
+creating a DGElist and doing differential gene expression
+```{r,}
+## create a DGE list
+dgeObj_1 <- DGEList(counts = Counts_all,
+                  group =filt_meta3$Condition,
+                  samples = filt_meta3)
+                  
+                  
+#Filter low expressed genes
+keep1 <- rowSums(edgeR::cpm(Counts_all)>0.5) >= 10
+table(keep1)
+dgeObj_1<- dgeObj_1[keep1,]
+
+
+#### normalize the data 
+dgeObj_1 <- calcNormFactors(dgeObj_1, method = "TMMwsp")
+
+
+####  Create a design 
+design=model.matrix(~0+ Condition ,
+                    data = filt_meta3)
+head(design)
+
+
+### ensuring that only the first and second columns of the design are included
+comp.group <- makeContrasts(ConditionABM  - ConditionCM ,levels = design[,1:3])
+comp.group
+
+
+#### dispersion
+dgeObj_1<-estimateDisp(y = dgeObj_1, design=design,
+                     trend.method = "loess", 
+                     tagwise = TRUE)
+plotBCV(dgeObj_1)
+
+
+### fit a glm model and test
+fit<-glmFit(dgeObj_1,design = design)
+lrt<-glmLRT(fit,contrast = comp.group)
+results_df<-topTags(lrt,n = Inf)$table
+table(results_df$FDR<0.05,results_df$logFC>0)
+
+
+#empirical controls
+contrl<-subset(results_df, FDR>0.98& logCPM>5)
+dim(contrl)
+
+
+### removing the unwanted variation
+K<-getK(Y = t(edgeR::cpm(dgeObj_1,log =TRUE,prior.count = 0.01)),X = filt_meta3[,1, drop=FALSE])
+K$k 
+correct_ruvg<-RUVg(x = edgeR::cpm(dgeObj_1,log =TRUE,prior.count = 0.01),isLog = TRUE,
+                   cIdx = rownames(contrl),k = 2)
+                   
+                   
+###add the corrections to the design 
+design=cbind(design,correct_ruvg$W)
+head(design)
+
+
+###estimate dispersion
+dgeObj_1<-estimateDisp(y = dgeObj_1, design,
+                     trend.method = "loess", 
+                     tagwise = TRUE)
+plotBCV(dgeObj_1)
+
+
+####DGE
+fit<-glmFit(dgeObj_1,design = design[,1:3])
+
+
+## run likelihood ratio test
+lrt<-glmLRT(fit,contrast = comp.group)
+
+
+##get the toptags
+topTags(lrt)
+res<-topTags(lrt,n = Inf)$table
+table(res$FDR<0.05,abs(res$logFC)>2)
+results_df <- res
+res_sig<-subset(res,(FDR<0.05 & abs(logFC)>2))
+dim(res_sig)
+results_df <- res
+
+
+
+##### annotation
+results_df$symbol<-mapIds(x = illuminaHumanv4.db,
+                          keys = rownames(results_df),
+                          column = "SYMBOL", keytype = "ENSEMBL")
+                          
+                          
+results_df$geneName<-mapIds(x = illuminaHumanv4.db,
+                            keys = rownames(results_df),
+                            column = "GENENAME", keytype = "ENSEMBL")
+                            
+ 
+ ##Subset the significant ones
+results_df_sig<-subset(results_df,(results_df$FDR<0.05 & abs(logFC)>2))
+dim(results_df_sig)
+CM <- subset(results_df_sig, logFC < 0)
+ABM <- subset(results_df_sig, logFC > 0)
+
+
+###write the results in a CSV file
+write.csv(results_df_sig , file = "final round 28 DGE.csv")
+dim(results_df_sig)
+```
+
+
+Doing the plots
+```{r,}
+###obtain the normalized counts for  differentially expressed genes plotting PCA 
+norm_counts1 <- correct_ruvg$normalizedCounts
+
+results_df_sig<-results_df_sig[order(results_df_sig$symbol),]
+
+sig_genes <- rownames(results_df_sig)
+
+norm_sig <- norm_counts1[sig_genes,][,rownames(metadata3)]
+
+ 
+ pca_1<-pca(t(norm_sig))
+ 
+ plotIndiv(pca_1, 
+          ind.names = F,
+          group =metadata3$Condition,
+          title = 'ABM vs CM',
+          style = 'ggplot2',
+          legend = TRUE, legend.title = 'Condition',
+          ellipse = TRUE,
+          size.title = rel(4.5),
+          size.xlabel = rel(3),
+          size.ylabel = rel(3),
+          size.axis = rel(2),
+          size.legend = rel(2),
+          point.lwd = 2,
+          size.legend.title = rel(2.5),
+          )
+
+### Plot Heatmap
+col_funp = colorRamp2(c(-1, 0, 2), c("steelblue", "black", "gold")) ##set the limits and colors
+
+
+col<-list(("ABM"="firebrick"),
+          ("CM"="blue"))
+          
+ha<-HeatmapAnnotation(Condition=metadata3$Condition)
+ha
+
+dim(norm_sig)
+
+Heatmap(t(scale(t((norm_sig)))),
+        top_annotation = ha,name = "mean z-score",
+        show_column_dend = T,show_row_dend = F,
+        cluster_rows = F,cluster_columns  =T,
+        row_split = as.factor(results_df_sig$logFC>0),
+        column_split = metadata3$Condition, 
+        show_row_names = F,clustering_method_columns = "ward.D2",
+        clustering_distance_columns = "canberra",
+        #row_labels = results_df_sig[1:50,]$symbol,
+        show_column_names = F,
+        col=col_funp)
+  #jpeg("Heatmap_ABM vs CM1.jpeg",width = 7,height = 10,units = "in",res = 100)      
+        
+#### plot a Volcano
+
+# create a column with thresholds
+results_df$Significant <- ifelse(results_df$FDR < 0.05, "FDR < 0.05", "Not Sig")
+dim(results_df)
+
+
+## setting the values
+results_df$Expression <- "not sig"
+
+
+# if logFC > 2 and FDR < 0.05, set as "up"
+results_df$Expression[results_df$logFC > 2 & results_df$FDR < 0.05] <- "up"
+
+
+# if log2FC < -2 and FDR< 0.05, set as "down"
+results_df$Expression[results_df$logFC < -2 & results_df$FDR < 0.05] <- "down"
+
+
+### the volcano
+###set the theme of the plot
+My_Theme = theme(
+  axis.title.x = element_text(size = 40),
+  axis.text.x = element_text(size =  35),
+  axis.text.y = element_text(size =  35),
+  axis.title.y = element_text(size = 40),                                                                 
+  legend.title = element_text(size=35),
+  legend.text = element_text(size=30),
+  plot.title = element_text(size = 60, face = "bold",hjust = 0.5)
+  )
+
+
+
+p <- ggplot(data= results_df, aes(x=logFC, y=-log10(FDR) )) +
+  geom_point(aes(color = Expression)) +
+  theme_bw(base_size = 12) + theme(legend.position = "right")+
+  geom_hline(yintercept=-log10(0.05), col="coral4" , linetype="dashed")+
+  geom_vline(xintercept =-2, col= "coral4", linetype="dashed" )+
+  geom_vline(xintercept =2, col= "coral4", linetype="dashed" )+
+  scale_color_manual(values = c("blue", "grey", "red"))+
+  geom_text_repel(
+    data = subset(results_df, subset= (FDR < 0.1 & logFC > 1) | (FDR < 0.1 & logFC < -1)),
+    aes(label = symbol),
+    size = 5,
+    box.padding = unit(0.35, "lines"),
+    point.padding = unit(0.3, "lines"))+
+ 
+  
+  
+  ggtitle("ABM vs CM")
+p+My_Theme
+                                                              
+```
